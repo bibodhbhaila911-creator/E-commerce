@@ -1,0 +1,16 @@
+# Dependencies & build output
+node_modules/
+dist/
+dist-ssr/
+
+# Environment variables / secrets (e.g. MONGO_URL)
+.env
+.env.*
+!.env.example
+
+# Deployment tooling
+.vercel/
+
+# Logs & OS files
+*.log
+.DS_Store
