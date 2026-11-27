@@ -96,6 +96,30 @@ jobs:
         with:
           name: ecommerce-release
 
+      - name: Check AWS secrets are set
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}
+        run: |
+          missing=0
+          for name in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY; do
+            if [ -z "${!name}" ]; then
+              echo "::error::Secret $name is empty or not set. Add it under Settings > Secrets and variables > Actions > Secrets tab > Repository secrets (exact name, uppercase)."
+              missing=1
+            fi
+          done
+          if [ -z "$AWS_SESSION_TOKEN" ]; then
+            if [[ "$AWS_ACCESS_KEY_ID" == ASIA* ]]; then
+              echo "::error::Secret AWS_SESSION_TOKEN is empty or not set. Your access key starts with ASIA (temporary/lab credentials), which require the session token from the lab page."
+              missing=1
+            else
+              echo "::notice::AWS_SESSION_TOKEN not set; continuing with long-term access keys."
+            fi
+          fi
+          if [ "$missing" -eq 1 ]; then exit 1; fi
+          echo "All required AWS secrets are present."
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
