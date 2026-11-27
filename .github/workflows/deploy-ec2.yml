@@ -1,0 +1,186 @@
+name: CI/CD - Ecommerce to AWS EC2 # Workflow name shown in the Actions tab
+
+on:
+  push:
+    branches: [main]
+    paths: # Only run when app / infra / this workflow changes
+      - "ecommerce/**"
+      - "infra/**"
+      - ".github/workflows/deploy-ec2.yml"
+  pull_request: # PRs only run the build/lint job (no AWS access needed)
+    branches: [main]
+    paths:
+      - "ecommerce/**"
+      - "infra/**"
+      - ".github/workflows/deploy-ec2.yml"
+  workflow_dispatch: # Manual run from the Actions tab
+    inputs:
+      instance_type:
+        description: EC2 instance type
+        default: t2.micro
+        type: choice
+        options: [t2.micro, t2.small, t2.medium, t3.micro, t3.small, t3.medium]
+
+concurrency: # Never run two deployments to the same stack at once
+  group: ecommerce-ec2-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: us-east-1 # Change if your lab uses another region
+  STACK_NAME: ecommerce-ec2-stack # CloudFormation stack name
+  TEMPLATE: infra/ec2-instance.yaml # CloudFormation template
+  NODE_VERSION: "22"
+
+jobs:
+  # ---------------------------------------------------------------- CI
+  build:
+    name: Build & lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: |
+            ecommerce/backend/package-lock.json
+            ecommerce/frontend/package-lock.json
+
+      - name: Backend - install & syntax check
+        working-directory: ecommerce/backend
+        run: |
+          npm ci --no-audit --no-fund
+          for f in index.js $(find src -name '*.js'); do node --check "$f"; done
+
+      - name: Frontend - install & lint
+        working-directory: ecommerce/frontend
+        run: |
+          npm ci --no-audit --no-fund
+          npm run lint
+
+      - name: Frontend - build for EC2
+        working-directory: ecommerce/frontend
+        env:
+          VITE_API_URL: /api # nginx on EC2 proxies /api -> Express backend
+        # --base=/ overrides the GitHub Pages base (/mygitrepo/) in vite.config.js for this build only
+        run: npx vite build --base=/
+
+      - name: Package release
+        run: |
+          mkdir -p release
+          tar -C ecommerce --exclude='backend/node_modules' -cf - backend | tar -C release -xf -
+          cp -r ecommerce/frontend/dist release/frontend
+          tar -czf ecommerce-release.tar.gz -C release .
+          ls -lh ecommerce-release.tar.gz
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ecommerce-release
+          path: ecommerce-release.tar.gz
+          retention-days: 7
+
+  # ---------------------------------------------------------------- CD
+  deploy:
+    name: Provision EC2 & deploy
+    needs: build
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ecommerce-release
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }} # Lab/temporary creds; ignored if the secret is empty
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Validate template
+        run: aws cloudformation validate-template --template-body "file://$TEMPLATE" > /dev/null
+
+      - name: Deploy CloudFormation stack
+        run: |
+          aws cloudformation deploy \
+            --stack-name "$STACK_NAME" \
+            --template-file "$TEMPLATE" \
+            --parameter-overrides InstanceType="${{ inputs.instance_type || 't2.micro' }}" \
+            --no-fail-on-empty-changeset
+
+      - name: Read stack outputs
+        id: stack
+        run: |
+          out() { aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+                    --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text; }
+          echo "instance_id=$(out InstanceId)" >> "$GITHUB_OUTPUT"
+          echo "public_ip=$(out PublicIp)"     >> "$GITHUB_OUTPUT"
+          echo "public_dns=$(out PublicDns)"   >> "$GITHUB_OUTPUT"
+          echo "key_pair_id=$(out KeyPairId)"  >> "$GITHUB_OUTPUT"
+
+      - name: Wait for instance to be ready
+        run: aws ec2 wait instance-status-ok --instance-ids "${{ steps.stack.outputs.instance_id }}"
+
+      - name: Fetch SSH key from SSM
+        run: |
+          mkdir -p ~/.ssh
+          aws ssm get-parameter --name "/ec2/keypair/${{ steps.stack.outputs.key_pair_id }}" \
+            --with-decryption --query Parameter.Value --output text > ~/.ssh/ec2.pem
+          chmod 600 ~/.ssh/ec2.pem
+
+      - name: Upload release
+        env:
+          HOST: ${{ steps.stack.outputs.public_ip }}
+          MONGO_URL: ${{ secrets.MONGO_URL }} # Optional: leave unset to run MongoDB on the instance
+        run: |
+          SSH_OPTS="-i $HOME/.ssh/ec2.pem -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o LogLevel=ERROR"
+          echo "SSH_OPTS=$SSH_OPTS" >> "$GITHUB_ENV"
+          # Wait for sshd
+          for i in $(seq 1 30); do ssh $SSH_OPTS ec2-user@"$HOST" true && break; echo "waiting for ssh ($i)"; sleep 10; done
+          umask 077
+          if [ -n "$MONGO_URL" ]; then printf "MONGO_URL='%s'\n" "$MONGO_URL" > ecommerce.env; else : > ecommerce.env; fi
+          scp $SSH_OPTS ecommerce-release.tar.gz ecommerce.env infra/remote-deploy.sh ec2-user@"$HOST":/tmp/
+          rm -f ecommerce.env
+
+      - name: Run deploy script on EC2
+        env:
+          HOST: ${{ steps.stack.outputs.public_ip }}
+        run: ssh $SSH_OPTS ec2-user@"$HOST" 'sudo bash /tmp/remote-deploy.sh && rm -f /tmp/remote-deploy.sh'
+
+      - name: Smoke test
+        env:
+          HOST: ${{ steps.stack.outputs.public_ip }}
+        run: |
+          for i in $(seq 1 12); do
+            if curl -fsS -o /dev/null "http://$HOST/" && curl -fsS -o /dev/null "http://$HOST/api/product"; then
+              echo "Frontend and API are reachable"; exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::Smoke test failed for http://$HOST"; exit 1
+
+      - name: Summary
+        if: always() && steps.stack.outputs.public_dns != ''
+        run: |
+          {
+            echo "### Ecommerce deployed to EC2"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Website | http://${{ steps.stack.outputs.public_dns }} |"
+            echo "| API     | http://${{ steps.stack.outputs.public_dns }}/api/product |"
+            echo "| Public IP | ${{ steps.stack.outputs.public_ip }} |"
+            echo "| Instance | ${{ steps.stack.outputs.instance_id }} |"
+            echo "| KeyPairId | ${{ steps.stack.outputs.key_pair_id }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove SSH key
+        if: always()
+        run: rm -f ~/.ssh/ec2.pem

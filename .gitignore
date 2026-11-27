@@ -1,0 +1,3 @@
+# Never commit SSH keys or AWS credentials
+*.pem
+.aws/

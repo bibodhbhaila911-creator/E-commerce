@@ -1,0 +1,78 @@
+AWSTemplateFormatVersion: "2010-09-09" # CloudFormation template format version (the only valid value)
+Description: EC2 host for the MERN ecommerce app (Amazon Linux 2023) with an auto-created key pair and a security group for SSH + HTTP. # Shown in the CloudFormation console
+
+Parameters: # Inputs that can be changed at deploy time
+  InstanceType: # EC2 size
+    Type: String
+    Default: t2.micro # Free-tier / lab-friendly size
+    AllowedValues: [t2.micro, t2.small, t2.medium, t3.micro, t3.small, t3.medium]
+    Description: EC2 instance size.
+  SSHLocation: # Who can SSH in (GitHub Actions runners need SSH to deploy, so default is open)
+    Type: String
+    Default: 0.0.0.0/0
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+    Description: CIDR allowed to SSH to the instance. GitHub-hosted runners use changing IPs, so 0.0.0.0/0 is needed for the pipeline.
+  LatestAmiId: # OS image, always the latest Amazon Linux 2023
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: Public SSM parameter resolving to the latest Amazon Linux 2023 AMI.
+
+Resources:
+  KeyPair: # SSH key pair; private key is stored in SSM Parameter Store at /ec2/keypair/<KeyPairId>
+    Type: AWS::EC2::KeyPair
+    Properties:
+      KeyName: !Sub "${AWS::StackName}-key"
+
+  SecurityGroup: # Firewall: SSH (deploys) + HTTP (website + /api)
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow SSH and HTTP for the ecommerce app
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref SSHLocation
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-sg"
+
+  Instance: # The app server: nginx (frontend + /api proxy) -> Node/Express backend -> MongoDB
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyPair
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeType: gp2 # Lab policies often deny the default gp3
+            VolumeSize: 16 # Room for Node, npm packages and a local MongoDB
+            DeleteOnTermination: true
+      SecurityGroupIds:
+        - !GetAtt SecurityGroup.GroupId
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-instance"
+
+Outputs: # Read by the workflow and printed in the run summary
+  InstanceId:
+    Description: EC2 instance ID
+    Value: !Ref Instance
+  PublicIp:
+    Description: Public IP of the instance
+    Value: !GetAtt Instance.PublicIp
+  PublicDns:
+    Description: Public DNS name of the instance
+    Value: !GetAtt Instance.PublicDnsName
+  WebsiteUrl:
+    Description: URL of the deployed app
+    Value: !Sub "http://${Instance.PublicDnsName}"
+  KeyPairId:
+    Description: Key pair ID; the private key is stored in SSM Parameter Store at /ec2/keypair/<KeyPairId>
+    Value: !GetAtt KeyPair.KeyPairId
+  KeyName:
+    Value: !Ref KeyPair
